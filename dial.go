@@ -4,12 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/sandertv/go-raknet/internal"
 	"log/slog"
 	"math/rand/v2"
 	"net"
 	"sync/atomic"
 	"time"
+
+	"github.com/sandertv/go-raknet/internal"
 
 	"github.com/sandertv/go-raknet/internal/message"
 )
@@ -88,6 +89,9 @@ func DialContext(ctx context.Context, address string) (*Conn, error) {
 // Dialer allows dialing a RakNet connection with specific configuration, such
 // as the protocol version of the connection and the logger used.
 type Dialer struct {
+	// ProtocolVersion represents the protocol version to use over the network. If set to zero, this is updated to
+	// currentProtocol.
+	ProtocolVersion byte
 	// ErrorLog is a logger that errors from packet decoding are logged to. By
 	// default, ErrorLog is set to a new slog.Logger with a slog.Handler that
 	// is always disabled. Error messages are thus not logged by default.
@@ -219,7 +223,10 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 		return nil, dialer.error("dial", err)
 	}
 
-	cs := &connState{conn: conn, raddr: conn.RemoteAddr(), id: atomic.AddInt64(&dialerID, 1), ticker: time.NewTicker(time.Second / 2)}
+	cs := &connState{conn: conn, raddr: conn.RemoteAddr(), protocol: protocolVersion, id: atomic.AddInt64(&dialerID, 1), ticker: time.NewTicker(time.Second / 2)}
+	if dialer.ProtocolVersion != 0 {
+		cs.protocol = dialer.ProtocolVersion
+	}
 	defer cs.ticker.Stop()
 	if err = cs.discoverMTU(ctx); err != nil {
 		return nil, dialer.error("dial", err)
@@ -233,7 +240,7 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 // dial finishes the RakNet connection sequence and returns a Conn if
 // successful.
 func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, error) {
-	conn := newConn(internal.ConnToPacketConn(state.conn), state.raddr, state.mtu, dialerConnectionHandler{})
+	conn := newConn(internal.ConnToPacketConn(state.conn), state.raddr, dialer.ProtocolVersion, state.mtu, dialerConnectionHandler{})
 	if err := conn.send((&message.ConnectionRequest{ClientGUID: state.id, RequestTime: timestamp()})); err != nil {
 		return nil, dialer.error("dial", fmt.Errorf("send connection request: %w", err))
 	}
@@ -281,6 +288,9 @@ type connState struct {
 	conn  net.Conn
 	raddr net.Addr
 	id    int64
+
+	// protocol is the protocol version of the connection. It is set when the connection is opened.
+	protocol byte
 
 	// mtu is the final MTU size found by sending an open connection request
 	// 1 packet. It is the MTU size sent by the server.
@@ -334,7 +344,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 			if err := response.UnmarshalBinary(b[1:n]); err != nil {
 				return fmt.Errorf("read incompatible protocol version: %w", err)
 			}
-			return fmt.Errorf("mismatched protocol: client protocol = %v, server protocol = %v", protocolVersion, response.ServerProtocol)
+			return fmt.Errorf("mismatched protocol: client protocol = %v, server protocol = %v", state.protocol, response.ServerProtocol)
 		}
 	}
 }
@@ -402,7 +412,7 @@ func (state *connState) request2(ctx context.Context, mtu uint16) {
 // openConnectionRequest1 sends an open connection request 1 packet to the
 // server. If not successful, an error is returned.
 func (state *connState) openConnectionRequest1(mtu uint16) {
-	data, _ := (&message.OpenConnectionRequest1{ClientProtocol: protocolVersion, MTU: mtu}).MarshalBinary()
+	data, _ := (&message.OpenConnectionRequest1{ClientProtocol: state.protocol, MTU: mtu}).MarshalBinary()
 	_, _ = state.conn.Write(data)
 }
 

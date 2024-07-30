@@ -5,8 +5,6 @@ import (
 	"encoding"
 	"errors"
 	"fmt"
-	"github.com/sandertv/go-raknet/internal"
-	"github.com/sandertv/go-raknet/internal/message"
 	"io"
 	"net"
 	"net/netip"
@@ -14,6 +12,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sandertv/go-raknet/internal"
+	"github.com/sandertv/go-raknet/internal/message"
 )
 
 const (
@@ -54,6 +55,9 @@ type Conn struct {
 	seq, orderIndex, messageIndex uint24
 	splitID                       uint32
 
+	// protocol represents the protocol version the client is currently connected over.
+	protocol byte
+
 	// mtu is the MTU size of the connection. Packets longer than this size
 	// must be split into fragments for them to arrive at the client without
 	// losing bytes.
@@ -91,11 +95,12 @@ type Conn struct {
 
 // newConn constructs a new connection specifically dedicated to the address
 // passed.
-func newConn(conn net.PacketConn, raddr net.Addr, mtu uint16, h connectionHandler) *Conn {
+func newConn(conn net.PacketConn, raddr net.Addr, protocol byte, mtu uint16, h connectionHandler) *Conn {
 	mtu = min(max(mtu, minMTUSize), maxMTUSize)
 	c := &Conn{
 		raddr:          raddr,
 		conn:           conn,
+		protocol:       protocol,
 		mtu:            mtu,
 		handler:        h,
 		pk:             new(packet),
@@ -322,6 +327,11 @@ func (conn *Conn) RemoteAddr() net.Addr {
 // same as the listener's.
 func (conn *Conn) LocalAddr() net.Addr {
 	return conn.conn.LocalAddr()
+}
+
+// ProtocolVersion returns the protocol version of the connection.
+func (conn *Conn) ProtocolVersion() byte {
+	return conn.protocol
 }
 
 // SetReadDeadline is unimplemented. It always returns ErrNotSupported.

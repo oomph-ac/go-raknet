@@ -3,6 +3,7 @@ package raknet
 import (
 	"errors"
 	"net"
+	"strings"
 )
 
 var (
@@ -16,6 +17,15 @@ var (
 	// supported on a raknet.Conn.
 	ErrNotSupported = errors.New("feature not supported")
 )
+
+// ErrConnectionClosed checks if the error passed was an error caused by reading from a Conn of which the
+// connection was closed.
+func ErrConnectionClosed(err error) bool {
+	if err == nil {
+		return false
+	}
+	return strings.Contains(err.Error(), net.ErrClosed.Error())
+}
 
 // error wraps the error passed into a net.OpError with the op as operation and
 // returns it, or nil if the error passed is nil.

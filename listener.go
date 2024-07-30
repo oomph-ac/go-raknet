@@ -2,7 +2,6 @@ package raknet
 
 import (
 	"fmt"
-	"github.com/sandertv/go-raknet/internal"
 	"log/slog"
 	"maps"
 	"math"
@@ -11,6 +10,9 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gameparrot/goquery"
+	"github.com/sandertv/go-raknet/internal"
 )
 
 // UpstreamPacketListener allows for a custom PacketListener implementation.
@@ -20,6 +22,9 @@ type UpstreamPacketListener interface {
 
 // ListenConfig may be used to pass additional configuration to a Listener.
 type ListenConfig struct {
+	// ProtocolVersions represents the protocol versions to allow over the network. If empty, this will just contain
+	ProtocolVersions []byte
+
 	// ErrorLog is a logger that errors from packet decoding are logged to. By
 	// default, ErrorLog is set to a new slog.Logger with a slog.Handler that
 	// is always disabled. Error messages are thus not logged by default.
@@ -39,6 +44,9 @@ type ListenConfig struct {
 	// BlockDuration defaults to 10s. If set to a negative value, IP addresses
 	// are never blocked on errors.
 	BlockDuration time.Duration
+
+	// If enabled, respond to UT3 query requests
+	EnableQuery bool
 }
 
 // Listener implements a RakNet connection listener. It follows the same
@@ -65,9 +73,18 @@ type Listener struct {
 	// several times throughout the connection sequence of RakNet.
 	id int64
 
+	// protocols is a list of protocol versions that are accepted by the listener.
+	protocols []byte
+
 	// pongData is a byte slice of data that is sent in an unconnected pong
 	// packet each time the client sends and unconnected ping to the server.
 	pongData atomic.Pointer[[]byte]
+
+	// queryHandler is the UT3 query handler
+	queryHandler *goquery.QueryServer
+
+	// If enabled, respond to queries
+	enableQuery bool
 }
 
 // listenerID holds the next ID to use for a Listener.
@@ -97,12 +114,18 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 		return nil, &net.OpError{Op: "listen", Net: "raknet", Source: nil, Addr: nil, Err: err}
 	}
 	listener := &Listener{
-		conf:     conf,
-		conn:     conn,
-		incoming: make(chan *Conn),
-		closed:   make(chan struct{}),
-		id:       atomic.AddInt64(&listenerID, 1),
-		sec:      newSecurity(conf),
+		conf:         conf,
+		conn:         conn,
+		incoming:     make(chan *Conn),
+		closed:       make(chan struct{}),
+		id:           atomic.AddInt64(&listenerID, 1),
+		sec:          newSecurity(conf),
+		protocols:    []byte{protocolVersion},
+		queryHandler: goquery.New(map[string]string{}, []string{}),
+		enableQuery:  conf.EnableQuery,
+	}
+	if len(conf.ProtocolVersions) > 0 {
+		listener.protocols = append(listener.protocols, conf.ProtocolVersions...)
 	}
 	listener.handler = &listenerConnectionHandler{l: listener, cookieSalt: rand.Uint32()}
 	listener.pongData.Store(new([]byte))
@@ -160,6 +183,19 @@ func (listener *Listener) PongData(data []byte) {
 		panic(fmt.Sprintf("pong data: must be no longer than %v bytes, got %v", math.MaxInt16, len(data)))
 	}
 	listener.pongData.Store(&data)
+}
+
+func (listener *Listener) SetQueryInfo(queryInfo map[string]string) {
+	listener.queryHandler.SetQueryInfo(queryInfo)
+}
+
+func (listener *Listener) SetQueryPlayers(queryPlayers []string) {
+	listener.queryHandler.SetPlayers(queryPlayers)
+}
+
+// EnableQuery sets if queries are enabled
+func (listener *Listener) EnableQuery(enabled bool) {
+	listener.enableQuery = enabled
 }
 
 // ID returns the unique ID of the listener. This ID is usually used by a
