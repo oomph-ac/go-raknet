@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"hash/crc32"
+	"log/slog"
 	"net"
 	"slices"
 	"time"
@@ -17,6 +18,7 @@ type connectionHandler interface {
 	handle(conn *Conn, b []byte) (handled bool, err error)
 	limitsEnabled() bool
 	close(conn *Conn)
+	log() *slog.Logger
 }
 
 type listenerConnectionHandler struct {
@@ -28,6 +30,10 @@ var (
 	errUnexpectedCRA           = errors.New("unexpected CONNECTION_REQUEST_ACCEPTED packet")
 	errUnexpectedAdditionalNIC = errors.New("unexpected additional NEW_INCOMING_CONNECTION packet")
 )
+
+func (h listenerConnectionHandler) log() *slog.Logger {
+	return h.l.conf.ErrorLog
+}
 
 func (h listenerConnectionHandler) limitsEnabled() bool {
 	return true
@@ -71,9 +77,10 @@ func (h listenerConnectionHandler) handleUnconnected(b []byte, addr net.Addr) er
 		// In some cases, the client will keep trying to send datagrams
 		// while it has already timed out. In this case, we should not return
 		// an error.
+		h.log().Debug("unexpected datagram", "raddr", addr.String())
 		return nil
 	}
-	return fmt.Errorf("unknown packet received (id=%x, len=%v)", b[0], len(b))
+	return fmt.Errorf("unknown unconnected packet (id=%x, len=%v)", b[0], len(b))
 }
 
 // handleUnconnectedPing handles an unconnected ping packet stored in buffer b,
@@ -201,13 +208,17 @@ func (h listenerConnectionHandler) handleNewIncomingConnection(conn *Conn) error
 	return nil
 }
 
-type dialerConnectionHandler struct{}
+type dialerConnectionHandler struct{ l *slog.Logger }
 
 var (
 	errUnexpectedCR            = errors.New("unexpected CONNECTION_REQUEST packet")
 	errUnexpectedAdditionalCRA = errors.New("unexpected additional CONNECTION_REQUEST_ACCEPTED packet")
 	errUnexpectedNIC           = errors.New("unexpected NEW_INCOMING_CONNECTION packet")
 )
+
+func (h dialerConnectionHandler) log() *slog.Logger {
+	return h.l
+}
 
 func (h dialerConnectionHandler) close(conn *Conn) {
 	_ = conn.conn.Close()

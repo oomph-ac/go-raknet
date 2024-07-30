@@ -1,6 +1,7 @@
 package raknet
 
 import (
+	"errors"
 	"fmt"
 	"log/slog"
 	"maps"
@@ -99,6 +100,8 @@ func (conf ListenConfig) Listen(address string) (*Listener, error) {
 	if conf.ErrorLog == nil {
 		conf.ErrorLog = slog.New(internal.DiscardHandler{})
 	}
+	conf.ErrorLog = conf.ErrorLog.With("src", "listener")
+
 	if conf.BlockDuration == 0 {
 		conf.BlockDuration = time.Second * 10
 	}
@@ -218,8 +221,8 @@ func (listener *Listener) listen() {
 		} else if n == 0 || listener.sec.blocked(addr) {
 			continue
 		}
-		if err = listener.handle(b[:n], addr); err != nil {
-			listener.conf.ErrorLog.Error("listener: handle packet: "+err.Error(), "address", addr.String(), "block-duration", max(0, listener.conf.BlockDuration))
+		if err = listener.handle(b[:n], addr); err != nil && !errors.Is(err, net.ErrClosed) {
+			listener.conf.ErrorLog.Error("handle packet: "+err.Error(), "raddr", addr.String(), "block-duration", max(0, listener.conf.BlockDuration))
 			listener.sec.block(addr)
 		}
 	}
