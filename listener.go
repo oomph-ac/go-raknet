@@ -216,8 +216,12 @@ func (listener *Listener) listen() {
 	for {
 		n, addr, err := listener.conn.ReadFrom(b)
 		if err != nil {
-			close(listener.incoming)
-			return
+			if errors.Is(err, net.ErrClosed) {
+				close(listener.incoming)
+				return
+			}
+			listener.conf.ErrorLog.Error("read from: " + err.Error())
+			continue
 		} else if n == 0 || listener.sec.blocked(addr) {
 			continue
 		}
@@ -237,7 +241,7 @@ func (listener *Listener) handle(b []byte, addr net.Addr) error {
 	}
 	conn := value.(*Conn)
 	select {
-	case <-conn.closed:
+	case <-conn.ctx.Done():
 		// Connection was closed already.
 		return nil
 	default:

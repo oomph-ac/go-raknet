@@ -1,32 +1,37 @@
 package internal
 
 import (
+	"context"
 	"sync"
 	"sync/atomic"
 )
 
-// ElasticChan is a channel that grows if its capacity is reached.
+// ElasticChan is a channel that grows if its capacity is reached. ElasticChan
+// is safe for concurrent use with multiple readers and 1 sender. Calling Send
+// from multiple goroutines simultaneously is unsafe.
 type ElasticChan[T any] struct {
 	mu  sync.RWMutex
 	len atomic.Int64
 	ch  chan T
+	lim int64
 }
 
 // Chan creates an ElasticChan of a size.
-func Chan[T any](size int) *ElasticChan[T] {
+func Chan[T any](size, max int) *ElasticChan[T] {
 	c := new(ElasticChan[T])
+	c.lim = int64(max)
 	c.grow(size)
 	return c
 }
 
-// Recv attempts to read a value from the channel. If cancel is closed, Recv
+// Recv attempts to read a value from the channel. If ctx is canceled, Recv
 // will return ok = false.
-func (c *ElasticChan[T]) Recv(cancel <-chan struct{}) (val T, ok bool) {
+func (c *ElasticChan[T]) Recv(ctx context.Context) (val T, ok bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 
 	select {
-	case <-cancel:
+	case <-ctx.Done():
 		return val, false
 	case val = <-c.ch:
 		if c.len.Add(-1) < 0 {
@@ -39,7 +44,7 @@ func (c *ElasticChan[T]) Recv(cancel <-chan struct{}) (val T, ok bool) {
 // Send sends a value to the channel. Send never blocks, because if the maximum
 // capacity of the underlying channel is reached, a larger one is created.
 func (c *ElasticChan[T]) Send(val T) {
-	if c.len.Load()+1 >= int64(cap(c.ch)) {
+	if ccap := int64(cap(c.ch)); c.len.Add(1) >= ccap && ccap < c.lim {
 		// This check happens outside a lock, meaning in the meantime, a call to
 		// Recv could cause the length to decrease, technically meaning growing
 		// is then unnecessary. That isn't a major issue though, as in most
@@ -47,7 +52,6 @@ func (c *ElasticChan[T]) Send(val T) {
 		c.growSend(val)
 		return
 	}
-	c.len.Add(1)
 	c.ch <- val
 }
 
@@ -57,8 +61,7 @@ func (c *ElasticChan[T]) growSend(val T) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
-	c.grow(cap(c.ch) * 2)
-	c.len.Add(1)
+	c.grow(max(cap(c.ch)*2, int(c.lim)))
 	c.ch <- val
 }
 
