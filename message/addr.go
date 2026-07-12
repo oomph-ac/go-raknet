@@ -16,6 +16,16 @@ func (addresses systemAddresses) sizeOf() int {
 	return size
 }
 
+func (addresses systemAddresses) validSizeOf() int {
+	size := 0
+	for _, addr := range addresses {
+		if addr.IsValid() {
+			size += sizeofAddr(addr)
+		}
+	}
+	return size
+}
+
 // sizeOfAddr returns the size in bytes of an address.
 func sizeofAddr(addr netip.AddrPort) int {
 	if addr.Addr().Is6() {

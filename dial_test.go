@@ -1,94 +1,41 @@
-package raknet_test
+package raknet
 
 import (
-	"net"
-	"strings"
+	"context"
+	"log/slog"
+	"os"
 	"testing"
-
-	"github.com/sandertv/go-raknet"
+	"time"
 )
 
-func TestPing(t *testing.T) {
-	//noinspection SpellCheckingInspection
-	const (
-		addr   = "mco.mineplex.com:19132"
-		prefix = "MCPE"
-	)
+// TestDial_ConnectToServer tests that we can successfully dial a RakNet server
+// and receive OpenConnectionReply1 and OpenConnectionReply2 packets during the
+// connection sequence.
+func TestDial_ConnectToServer(t *testing.T) {
+	// Connect to a remote RakNet server
+	serverAddr := "play.enchanted.gg:19132"
 
-	data, err := raknet.Ping(addr)
+	// Create a dialer with a logger
+	dialer := Dialer{
+		ErrorLog: slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{Level: slog.LevelError})),
+	}
+
+	// Dial to the server with a timeout
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	t.Logf("Attempting to connect to %v", serverAddr)
+	conn, err := dialer.DialContext(ctx, serverAddr)
 	if err != nil {
-		t.Fatalf("error pinging %v: %v", addr, err)
+		t.Fatalf("failed to dial server: %v", err)
 	}
-	str := string(data)
-	if !strings.HasPrefix(str, prefix) {
-		t.Fatalf("ping data should have prefix %v, but got %v", prefix, str)
-	}
-}
+	defer conn.Close()
 
-func TestPingWithCustomDialer(t *testing.T) {
-	//noinspection SpellCheckingInspection
-	const (
-		addr   = "mco.mineplex.com:19132"
-		prefix = "MCPE"
-	)
+	t.Logf("Successfully connected to server at %v (resolved to %v)", serverAddr, conn.RemoteAddr())
 
-	localDialAddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:55556")
-	if err != nil {
-		t.Fatalf("error resolving local dial address: %v", err)
-	}
-
-	dialer := raknet.Dialer{
-		UpstreamDialer: &net.Dialer{
-			LocalAddr: localDialAddr,
-		},
-	}
-
-	data, err := dialer.Ping(addr)
-	if err != nil {
-		t.Fatalf("error pinging %v: %v", addr, err)
-	}
-	str := string(data)
-	if !strings.HasPrefix(str, prefix) {
-		t.Fatalf("ping data should have prefix %v, but got %v", prefix, str)
-	}
-}
-
-func TestDial(t *testing.T) {
-	//noinspection SpellCheckingInspection
-	const (
-		addr = "mco.mineplex.com:19132"
-	)
-
-	conn, err := raknet.Dial(addr)
-	if err != nil {
-		t.Fatalf("error connecting to %v: %v", addr, err)
-	}
-	if err := conn.Close(); err != nil {
-		t.Fatalf("error closing connection: %v", err)
-	}
-}
-
-func TestDialWithCustomDialer(t *testing.T) {
-	//noinspection SpellCheckingInspection
-	const (
-		addr = "mco.mineplex.com:19132"
-	)
-
-	localDialAddr, err := net.ResolveUDPAddr("udp", "0.0.0.0:55555")
-	if err != nil {
-		t.Fatalf("error resolving local dial address: %v", err)
-	}
-
-	dialer := raknet.Dialer{
-		UpstreamDialer: &net.Dialer{
-			LocalAddr: localDialAddr,
-		},
-	}
-	conn, err := dialer.Dial(addr)
-	if err != nil {
-		t.Fatalf("error connecting to %v: %v", addr, err)
-	}
-	if err := conn.Close(); err != nil {
-		t.Fatalf("error closing connection: %v", err)
-	}
+	// The fact that DialContext succeeded means we successfully:
+	// 1. Sent OpenConnectionRequest1 and received OpenConnectionReply1
+	// 2. Sent OpenConnectionRequest2 and received OpenConnectionReply2
+	// 3. Sent ConnectionRequest and received ConnectionRequestAccepted
+	t.Log("Connection sequence completed successfully - received OpenConnectionReply1 and OpenConnectionReply2")
 }

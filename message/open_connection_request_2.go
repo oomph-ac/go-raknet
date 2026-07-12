@@ -26,7 +26,7 @@ func (pk *OpenConnectionRequest2) MarshalBinary() (data []byte, err error) {
 	}
 	b := make([]byte, 27+offset+cookieOffset)
 	b[0] = IDOpenConnectionRequest2
-	copy(b[1:], unconnectedMessageSequence[:])
+	copy(b[1:], UnconnectedMessageSequence[:])
 	if pk.ServerHasSecurity {
 		binary.BigEndian.PutUint32(b[17:], pk.Cookie)
 	}

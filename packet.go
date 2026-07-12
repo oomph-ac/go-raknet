@@ -10,14 +10,20 @@ import (
 const (
 	// bitFlagDatagram is set for every valid datagram. It is used to identify
 	// packets that are datagrams.
-	bitFlagDatagram = 0x80
+	bitFlagDatagram = 0b10000000
 	// bitFlagACK is set for every ACK packet.
-	bitFlagACK = 0x40
+	bitFlagACK = 0b01000000
+	// bitFlagHasBAndAS - seems to share the same bit with bitFlagNACK
+	bitFlagHasBAndAS = 0b00100000
 	// bitFlagNACK is set for every NACK packet.
-	bitFlagNACK = 0x20
+	bitFlagNACK = 0b00100000
+	// bitFlagPacketPair ...
+	bitFlagPacketPair = 0b00010000
+	// bitFlagContinuousSend ...
+	bitFlagContinuousSend = 0b00001000
 	// bitFlagNeedsBAndAS is set for every datagram with packet data, but is not
 	// actually used.
-	bitFlagNeedsBAndAS = 0x04
+	bitFlagNeedsBAndAS = 0b00000100
 )
 
 // noinspection GoUnusedConst
@@ -25,8 +31,6 @@ const (
 	// reliabilityUnreliable means that the packet sent could arrive out of
 	// order, be duplicated, or just not arrive at all. It is usually used for
 	// high frequency packets of which the order does not matter.
-	//lint:ignore U1000 While this constant is unused, it is here for the sake
-	// of having all reliabilities documented.
 	reliabilityUnreliable byte = iota
 	// reliabilityUnreliableSequenced means that the packet sent could be
 	// duplicated or not arrive at all, but ensures that it is always handled in
@@ -42,10 +46,28 @@ const (
 	// but ensures that the packet will be in the right order and not be
 	// duplicated.
 	reliabilityReliableSequenced
+)
 
-	// splitFlag is set in the header if the packet was split. If so, the
-	// encapsulation contains additional data about the fragment.
-	splitFlag = 0x10
+// Exported reliability constants for use with WriteWithReliability.
+const (
+	// ReliabilityUnreliable means that the packet sent could arrive out of
+	// order, be duplicated, or just not arrive at all. It is usually used for
+	// high frequency packets of which the order does not matter.
+	ReliabilityUnreliable = reliabilityUnreliable
+	// ReliabilityUnreliableSequenced means that the packet sent could be
+	// duplicated or not arrive at all, but ensures that it is always handled in
+	// the right order.
+	ReliabilityUnreliableSequenced = reliabilityUnreliableSequenced
+	// ReliabilityReliable means that the packet sent could not arrive, or
+	// arrive out of order, but ensures that the packet is not duplicated.
+	ReliabilityReliable = reliabilityReliable
+	// ReliabilityReliableOrdered means that every packet sent arrives, arrives
+	// in the right order and is not duplicated.
+	ReliabilityReliableOrdered = reliabilityReliableOrdered
+	// ReliabilityReliableSequenced means that the packet sent could not arrive,
+	// but ensures that the packet will be in the right order and not be
+	// duplicated.
+	ReliabilityReliableSequenced = reliabilityReliableSequenced
 )
 
 // packet is an encapsulation around every packet sent after the connection is
@@ -69,7 +91,7 @@ type packet struct {
 func (pk *packet) write(buf *bytes.Buffer) {
 	header := pk.reliability << 5
 	if pk.split {
-		header |= splitFlag
+		header |= bitFlagPacketPair
 	}
 
 	buf.WriteByte(header)
@@ -99,7 +121,7 @@ func (pk *packet) read(b []byte) (int, error) {
 		return 0, io.ErrUnexpectedEOF
 	}
 	header := b[0]
-	pk.split = (header & splitFlag) != 0
+	pk.split = (header & bitFlagPacketPair) != 0
 	pk.reliability = (header & 224) >> 5
 
 	n := binary.BigEndian.Uint16(b[1:]) >> 3

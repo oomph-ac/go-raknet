@@ -1,5 +1,7 @@
 package message
 
+import "errors"
+
 const (
 	IDConnectedPing                  byte = 0x00
 	IDUnconnectedPing                byte = 0x01
@@ -18,8 +20,12 @@ const (
 	IDIncompatibleProtocolVersion byte = 0x19
 
 	IDUnconnectedPong byte = 0x1c
+
+	IDMinecraftPacket byte = 0xfe
 )
 
-// unconnectedMessageSequence is a sequence of bytes which is found in every unconnected message sent in
-// RakNet.
-var unconnectedMessageSequence = [16]byte{0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78}
+var (
+	// UnconnectedMessageSequence is a sequence of bytes which is found in every unconnected message sent in RakNet.
+	UnconnectedMessageSequence             = [16]byte{0x00, 0xff, 0xff, 0x00, 0xfe, 0xfe, 0xfe, 0xfe, 0xfd, 0xfd, 0xfd, 0xfd, 0x12, 0x34, 0x56, 0x78}
+	ErrorInvalidUnconnectedMessageSequence = errors.New("invalid unconnected message sequence")
+)

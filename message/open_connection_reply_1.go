@@ -1,6 +1,7 @@
 package message
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 )
@@ -17,7 +18,12 @@ func (pk *OpenConnectionReply1) UnmarshalBinary(data []byte) error {
 	if len(data) < 27 || len(data) < 27+int(data[24])*4 {
 		return io.ErrUnexpectedEOF
 	}
-	// Magic: 16 bytes.
+
+	// Validate unconnected message sequence.
+	if !bytes.Equal(data[:16], UnconnectedMessageSequence[:]) {
+		return ErrorInvalidUnconnectedMessageSequence
+	}
+
 	pk.ServerGUID = int64(binary.BigEndian.Uint64(data[16:]))
 	pk.ServerHasSecurity = data[24] != 0
 	if pk.ServerHasSecurity {
@@ -35,7 +41,7 @@ func (pk *OpenConnectionReply1) MarshalBinary() (data []byte, err error) {
 	}
 	b := make([]byte, 28+offset)
 	b[0] = IDOpenConnectionReply1
-	copy(b[1:], unconnectedMessageSequence[:])
+	copy(b[1:], UnconnectedMessageSequence[:])
 	binary.BigEndian.PutUint64(b[17:], uint64(pk.ServerGUID))
 	if pk.ServerHasSecurity {
 		b[25] = 1

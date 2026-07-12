@@ -7,12 +7,19 @@ import (
 	"log/slog"
 	"math/rand/v2"
 	"net"
+	"os"
 	"sync/atomic"
 	"time"
 
 	"github.com/sandertv/go-raknet/internal"
 
-	"github.com/sandertv/go-raknet/internal/message"
+	"github.com/sandertv/go-raknet/message"
+)
+
+var (
+	// errReply2Timeout is returned when more than 500ms has elapsed since
+	// receiving OpenConnectionReply2 without completing the connection.
+	errReply2Timeout = errors.New("timeout: more than 500ms elapsed since OpenConnectionReply2")
 )
 
 // UpstreamDialer is an interface for anything compatible with net.Dialer.
@@ -142,7 +149,7 @@ func (dialer Dialer) PingContext(ctx context.Context, address string) (response 
 		return nil, dialer.error("ping", err)
 	}
 
-	data = make([]byte, 1492)
+	data = make([]byte, 65535)
 	n, err := conn.Read(data)
 	if err != nil {
 		return nil, dialer.error("ping", err)
@@ -212,9 +219,11 @@ func (dialer Dialer) DialTimeout(address string, timeout time.Duration) (*Conn, 
 // context.Context is closed.
 func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, error) {
 	if dialer.ErrorLog == nil {
-		dialer.ErrorLog = slog.New(internal.DiscardHandler{})
+		dialer.ErrorLog = slog.New(slog.NewTextHandler(os.Stdout, nil))
 	}
 
+	// Create UDP socket once - we need to keep the same source port across retries
+	// so the server recognizes us after we've completed the first phase
 	conn, err := dialer.dial(ctx, address)
 	if err != nil {
 		return nil, dialer.error("dial", err)
@@ -223,16 +232,42 @@ func (dialer Dialer) DialContext(ctx context.Context, address string) (*Conn, er
 
 	cs := &connState{conn: conn, raddr: conn.RemoteAddr(), id: atomic.AddInt64(&dialerID, 1), ticker: time.NewTicker(time.Second / 2)}
 	defer cs.ticker.Stop()
-	if err = cs.discoverMTU(ctx); err != nil {
-		return nil, dialer.error("dial", fmt.Errorf("discover mtu: %w", err))
-	} else if err = cs.openConnection(ctx); err != nil {
-		return nil, dialer.error("dial", fmt.Errorf("open connection: %w", err))
-	}
 
-	return dialer.connect(ctx, cs)
+	// Retry loop: if we don't receive OpenConnectionReply2 within 500ms, restart from discoverMTU
+	// This follows vanilla client behavior. We keep the same socket so the server recognizes our source address.
+	for {
+		// Reset read deadline for MTU discovery
+		_ = conn.SetReadDeadline(time.Time{})
+		if deadline, ok := ctx.Deadline(); ok {
+			_ = conn.SetDeadline(deadline)
+		}
+
+		if err = cs.discoverMTU(ctx); err != nil {
+			cs.close()
+			return nil, dialer.error("dial", fmt.Errorf("discover mtu: %w", err))
+		}
+
+		err = cs.openConnection(ctx)
+		if err != nil {
+			// Check if this is a timeout error that should trigger a retry
+			if errors.Is(err, errReply2Timeout) {
+				// Restart from discoverMTU but keep the same socket
+				continue
+			}
+			cs.close()
+			return nil, dialer.error("dial", fmt.Errorf("open connection: %w", err))
+		}
+
+		rakConn, err := dialer.connect(ctx, cs)
+		if err != nil {
+			cs.close()
+			return nil, err
+		}
+		return rakConn, nil
+	}
 }
 
-// dial finishes the RakNet connection sequence and returns a Conn if
+// connect finishes the RakNet connection sequence and returns a Conn if
 // successful.
 func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, error) {
 	conn := newConn(internal.ConnToPacketConn(state.conn), state.raddr, state.mtu, dialerConnectionHandler{l: dialer.ErrorLog})
@@ -258,7 +293,7 @@ func (dialer Dialer) connect(ctx context.Context, state *connState) (*Conn, erro
 func (dialer Dialer) clientListen(rakConn *Conn, conn net.Conn) {
 	// Create a buffer with the maximum size a UDP packet sent over RakNet is
 	// allowed to have. We can re-use this buffer for each packet.
-	b := make([]byte, rakConn.effectiveMTU())
+	b := make([]byte, 65535)
 	for {
 		n, err := conn.Read(b)
 		if err == nil && n != 0 {
@@ -292,7 +327,7 @@ type connState struct {
 	ticker *time.Ticker
 }
 
-var mtuSizes = []uint16{1492, 1200, 576}
+var mtuSizes = []uint16{1200, 576}
 
 // discoverMTU starts discovering an MTU size, the maximum packet size we
 // can send, by sending multiple open connection request 1 packets to the
@@ -304,35 +339,30 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 	go state.request1(ctx, mtuSizes)
 
 	b := make([]byte, 1492)
+read_loop:
 	for {
 		// Start reading in a loop so that we can find an open connection reply
 		// 1 packet.
 		n, err := state.conn.Read(b)
 		if err != nil || n == 0 {
-			state.close()
 			return err
 		}
 		switch b[0] {
 		case message.IDOpenConnectionReply1:
 			response := &message.OpenConnectionReply1{}
 			if err := response.UnmarshalBinary(b[1:n]); err != nil {
+				if errors.Is(err, message.ErrorInvalidUnconnectedMessageSequence) {
+					continue read_loop // Ignore invalid unconnected message sequence errors - look for next packet.
+				}
 				return fmt.Errorf("read open connection reply 1: %w", err)
 			}
 			state.serverSecurity, state.cookie = response.ServerHasSecurity, response.Cookie
-			if response.ServerGUID == 0 || response.MTU < 400 || response.MTU > 1500 {
-				// This is an awful hack we cooked up to deal with OVH 'DDoS'
-				// protection. For some reason they send a broken MTU size
-				// first. Sending a Request2 followed by a Request1 deals with
-				// this.
-				state.openConnectionRequest2(response.MTU)
-				continue
-			}
 			state.mtu = response.MTU
 			return nil
 		case message.IDIncompatibleProtocolVersion:
 			response := &message.IncompatibleProtocolVersion{}
 			if err := response.UnmarshalBinary(b[1:n]); err != nil {
-				return fmt.Errorf("read incompatible protocol version: %w", err)
+				continue read_loop
 			}
 			return fmt.Errorf("mismatched protocol: client protocol = %v, server protocol = %v", protocolVersion, response.ServerProtocol)
 		}
@@ -342,7 +372,7 @@ func (state *connState) discoverMTU(ctx context.Context) error {
 // request1 sends a message.OpenConnectionRequest1 three times for each mtu
 // size passed, spaced by 500ms.
 func (state *connState) request1(ctx context.Context, sizes []uint16) {
-	state.ticker.Reset(time.Second / 2)
+	state.ticker.Reset(3 * time.Second)
 	for _, size := range sizes {
 		for range 3 {
 			state.openConnectionRequest1(size)
@@ -356,46 +386,47 @@ func (state *connState) request1(ctx context.Context, sizes []uint16) {
 	}
 }
 
-// openConnection sends open connection request 2 packets continuously
-// until it receives an open connection reply 2 packet from the server.
+// openConnection sends an open connection request 2 packet and waits up to
+// 500ms for an open connection reply 2 packet from the server. If no reply
+// is received within 500ms, errReply2Timeout is returned to trigger a retry
+// from the beginning of the connection sequence (vanilla client behavior).
 func (state *connState) openConnection(ctx context.Context) error {
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
+	// Send OpenConnectionRequest2
+	state.openConnectionRequest2(state.mtu)
 
-	go state.request2(ctx, state.mtu)
+	// Set a 500ms read deadline for receiving OpenConnectionReply2
+	// This implements vanilla client behavior: retry from the beginning if no reply within 500ms
+	_ = state.conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
 
-	b := make([]byte, 1492)
+	b := make([]byte, 65535)
 	for {
 		// Start reading in a loop so that we can find open connection reply 2
 		// packets.
 		n, err := state.conn.Read(b)
-		if err != nil || n == 0 {
-			state.close()
+		if err != nil {
+			// Check if this is a timeout - if so, return errReply2Timeout to trigger retry
+			if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+				return errReply2Timeout
+			}
 			return err
+		}
+		if n == 0 {
+			continue
 		}
 		if b[0] != message.IDOpenConnectionReply2 {
 			continue
 		}
 		pk := &message.OpenConnectionReply2{}
 		if err = pk.UnmarshalBinary(b[1:n]); err != nil {
+			if errors.Is(err, message.ErrorInvalidUnconnectedMessageSequence) {
+				continue // Ignore invalid unconnected message sequence errors - look for next packet.
+			}
 			return fmt.Errorf("read open connection reply 2: %w", err)
 		}
 		state.mtu = pk.MTU
+		// Reset deadline for subsequent operations
+		_ = state.conn.SetReadDeadline(time.Time{})
 		return nil
-	}
-}
-
-// request2 continuously sends a message.OpenConnectionRequest2 every 500ms.
-func (state *connState) request2(ctx context.Context, mtu uint16) {
-	state.ticker.Reset(time.Second / 2)
-	for {
-		state.openConnectionRequest2(mtu)
-		select {
-		case <-state.ticker.C:
-			continue
-		case <-ctx.Done():
-			return
-		}
 	}
 }
 

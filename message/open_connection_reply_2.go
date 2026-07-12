@@ -1,6 +1,7 @@
 package message
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 	"net/netip"
@@ -17,7 +18,10 @@ func (pk *OpenConnectionReply2) UnmarshalBinary(data []byte) error {
 	if len(data) < 24 || len(data) < 27+addrSize(data[24:]) {
 		return io.ErrUnexpectedEOF
 	}
-	// Magic: 16 bytes.
+	// Validate unconnected message sequence.
+	if !bytes.Equal(data[:16], UnconnectedMessageSequence[:]) {
+		return ErrorInvalidUnconnectedMessageSequence
+	}
 	pk.ServerGUID = int64(binary.BigEndian.Uint64(data[16:]))
 	pk.ClientAddress, _ = addr(data[24:])
 	offset := addrSize(data[24:])
@@ -31,7 +35,7 @@ func (pk *OpenConnectionReply2) MarshalBinary() (data []byte, err error) {
 	offset := sizeofAddr(pk.ClientAddress)
 	b := make([]byte, 28+offset)
 	b[0] = IDOpenConnectionReply2
-	copy(b[1:], unconnectedMessageSequence[:])
+	copy(b[1:], UnconnectedMessageSequence[:])
 	binary.BigEndian.PutUint64(b[17:], uint64(pk.ServerGUID))
 	putAddr(b[25:], pk.ClientAddress)
 	binary.BigEndian.PutUint16(b[25+offset:], pk.MTU)

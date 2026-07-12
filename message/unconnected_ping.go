@@ -1,6 +1,7 @@
 package message
 
 import (
+	"bytes"
 	"encoding/binary"
 	"io"
 )
@@ -14,7 +15,7 @@ func (pk *UnconnectedPing) MarshalBinary() (data []byte, err error) {
 	b := make([]byte, 33)
 	b[0] = IDUnconnectedPing
 	binary.BigEndian.PutUint64(b[1:], uint64(pk.PingTime))
-	copy(b[9:], unconnectedMessageSequence[:])
+	copy(b[9:], UnconnectedMessageSequence[:])
 	binary.BigEndian.PutUint64(b[25:], uint64(pk.ClientGUID))
 	return b, nil
 }
@@ -24,7 +25,10 @@ func (pk *UnconnectedPing) UnmarshalBinary(data []byte) error {
 		return io.ErrUnexpectedEOF
 	}
 	pk.PingTime = int64(binary.BigEndian.Uint64(data))
-	// Magic: 16 bytes.
+	// Validate unconnected message sequence.
+	if !bytes.Equal(data[8:24], UnconnectedMessageSequence[:]) {
+		return ErrorInvalidUnconnectedMessageSequence
+	}
 	pk.ClientGUID = int64(binary.BigEndian.Uint64(data[24:]))
 	return nil
 }

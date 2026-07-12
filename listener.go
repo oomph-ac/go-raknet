@@ -3,15 +3,17 @@ package raknet
 import (
 	"errors"
 	"fmt"
-	"github.com/sandertv/go-raknet/internal"
 	"log/slog"
 	"maps"
 	"math"
 	"math/rand/v2"
 	"net"
+	"os"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/sandertv/go-raknet/message"
 )
 
 // UpstreamPacketListener allows for a custom PacketListener implementation.
@@ -28,6 +30,14 @@ type ListenConfig struct {
 
 	// UpstreamPacketListener adds an abstraction for net.ListenPacket.
 	UpstreamPacketListener UpstreamPacketListener
+
+	// ReusePortSockets specifies how many UDP sockets should be opened for a
+	// single listener. Values less than 1 default to 1.
+	//
+	// On Linux, values greater than 1 use SO_REUSEPORT for the default socket
+	// listener. When UpstreamPacketListener is set, this value controls how many
+	// times ListenPacket is called.
+	ReusePortSockets int
 
 	// DisableCookies specifies if cookies should be generated and verified for
 	// new incoming connections. This is a security measure against IP spoofing,
@@ -54,6 +64,9 @@ type Listener struct {
 	closed chan struct{}
 
 	conn net.PacketConn
+	// conns holds the packet sockets used by the listener. conn always points to
+	// the first entry.
+	conns []net.PacketConn
 	// incoming is a channel of incoming connections. Connections that end up in
 	// here will also end up in the connections map.
 	incoming chan *Conn
@@ -71,6 +84,11 @@ type Listener struct {
 	pongData atomic.Pointer[[]byte]
 }
 
+type listenerUnconnectedDatagram struct {
+	addr net.Addr
+	data []byte
+}
+
 // listenerID holds the next ID to use for a Listener.
 var listenerID = rand.Int64()
 
@@ -81,38 +99,93 @@ var listenerID = rand.Int64()
 // as the used log and/or the accepted protocol.
 func (conf ListenConfig) Listen(address string) (*Listener, error) {
 	if conf.ErrorLog == nil {
-		conf.ErrorLog = slog.New(internal.DiscardHandler{})
+		conf.ErrorLog = slog.New(slog.NewTextHandler(os.Stdout, nil))
 	}
 	conf.ErrorLog = conf.ErrorLog.With("src", "listener")
 
 	if conf.BlockDuration == 0 {
 		conf.BlockDuration = time.Second * 10
 	}
-	var conn net.PacketConn
-	var err error
-
-	if conf.UpstreamPacketListener == nil {
-		conn, err = net.ListenPacket("udp", address)
-	} else {
-		conn, err = conf.UpstreamPacketListener.ListenPacket("udp", address)
+	if conf.ReusePortSockets < 1 {
+		conf.ReusePortSockets = 1
 	}
+
+	conns, err := conf.listenPacketConns("udp", address, conf.ReusePortSockets)
 	if err != nil {
 		return nil, &net.OpError{Op: "listen", Net: "raknet", Source: nil, Addr: nil, Err: err}
 	}
 	listener := &Listener{
 		conf:     conf,
-		conn:     conn,
-		incoming: make(chan *Conn),
+		conn:     conns[0],
+		conns:    conns,
+		incoming: make(chan *Conn, 8),
 		closed:   make(chan struct{}),
 		id:       atomic.AddInt64(&listenerID, 1),
 		sec:      newSecurity(conf),
 	}
-	listener.handler = &listenerConnectionHandler{l: listener, cookieSalt: rand.Uint32()}
+
+	listener.handler = &listenerConnectionHandler{
+		listener: listener,
+	}
 	listener.pongData.Store(new([]byte))
 
 	go listener.listen()
+	go listener.updateConnections()
 	go listener.sec.gc(listener.closed)
+	go listener.handler.cleanup(listener.closed)
 	return listener, nil
+}
+
+func (conf ListenConfig) listenPacketConns(network, address string, socketCount int) ([]net.PacketConn, error) {
+	if socketCount < 1 {
+		socketCount = 1
+	}
+	if conf.UpstreamPacketListener != nil {
+		return openPacketConns(socketCount, address, func(bindAddress string) (net.PacketConn, error) {
+			return conf.UpstreamPacketListener.ListenPacket(network, bindAddress)
+		})
+	}
+	return listenPacketConnsDefault(network, address, socketCount)
+}
+
+func openPacketConns(socketCount int, address string, listen func(address string) (net.PacketConn, error)) ([]net.PacketConn, error) {
+	conns := make([]net.PacketConn, 0, socketCount)
+	bindAddress := address
+	for i := 0; i < socketCount; i++ {
+		conn, err := listen(bindAddress)
+		if err != nil {
+			_ = closePacketConns(conns)
+			return nil, err
+		}
+		conns = append(conns, conn)
+		if localAddr := conn.LocalAddr(); localAddr != nil {
+			bindAddress = localAddr.String()
+		}
+	}
+	return conns, nil
+}
+
+func closePacketConns(conns []net.PacketConn) error {
+	var errs []error
+	for _, conn := range conns {
+		if conn == nil {
+			continue
+		}
+		if err := conn.Close(); err != nil && !errors.Is(err, net.ErrClosed) {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+func (listener *Listener) packetConns() []net.PacketConn {
+	if len(listener.conns) != 0 {
+		return listener.conns
+	}
+	if listener.conn != nil {
+		return []net.PacketConn{listener.conn}
+	}
+	return nil
 }
 
 // Listen listens on the address passed and returns a listener that may be used
@@ -149,7 +222,7 @@ func (listener *Listener) Close() error {
 	var err error
 	listener.once.Do(func() {
 		close(listener.closed)
-		err = listener.conn.Close()
+		err = closePacketConns(listener.packetConns())
 	})
 	return err
 }
@@ -171,53 +244,156 @@ func (listener *Listener) ID() int64 {
 	return listener.id
 }
 
+const (
+	connectionSequenceTimeout          = 10 * time.Second
+	listenerUnconnectedDatagramWorkers = 4
+	listenerUnconnectedDatagramBuffer  = 4096
+)
+
+// updateConnections deletes all connections that have failed to pass the pre-connection sequence and
+// have been in the connections map for more than 30 seconds. It also updates connections that
+// recently just completed the full connection sequence.
+func (listener *Listener) updateConnections() {
+	ticker := time.NewTicker(50 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			listener.connections.Range(func(key, value any) bool {
+				conn := value.(*Conn)
+				select {
+				case <-listener.closed:
+					return true
+				case <-conn.connected:
+					// OK: The connection has already completed the connection sequence.
+					if conn.accepted.CompareAndSwap(false, true) {
+						listener.incoming <- conn
+					}
+				default:
+					if time.Since(conn.createdAt) > connectionSequenceTimeout {
+						conn.closeImmediately()
+						listener.connections.Delete(key)
+						listener.handler.log().Debug("connection failed to complete connection sequence in time", "raddr", conn.raddr.String())
+					}
+				}
+				return true
+			})
+		case <-listener.closed:
+			return
+		}
+	}
+}
+
 // listen continuously reads from the listener's UDP connection, until closed
 // has a value in it.
 func (listener *Listener) listen() {
+	conns := listener.packetConns()
+	if len(conns) == 0 {
+		close(listener.incoming)
+		return
+	}
+
+	unconnectedDatagrams := make(chan listenerUnconnectedDatagram, listenerUnconnectedDatagramBuffer)
+	defer close(unconnectedDatagrams)
+
+	listener.startUnconnectedDatagramWorkers(unconnectedDatagrams)
+
+	var wg sync.WaitGroup
+	for _, conn := range conns {
+		conn := conn
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			listener.listenConn(conn, unconnectedDatagrams)
+		}()
+	}
+	wg.Wait()
+	close(listener.incoming)
+}
+
+func (listener *Listener) listenConn(conn net.PacketConn, unconnectedDatagrams chan<- listenerUnconnectedDatagram) {
+	if listener.listenOptimized(conn, unconnectedDatagrams) {
+		return
+	}
+	listener.listenReadFrom(conn, unconnectedDatagrams)
+}
+
+// listenReadFrom continuously reads from the listener's UDP connection using
+// net.PacketConn.ReadFrom, until closed has a value in it.
+func (listener *Listener) listenReadFrom(conn net.PacketConn, unconnectedDatagrams chan<- listenerUnconnectedDatagram) {
 	// Create a buffer with the maximum size a UDP packet sent over RakNet is
 	// allowed to have. We can re-use this buffer for each packet.
 	b := make([]byte, 1500)
 	for {
-		n, addr, err := listener.conn.ReadFrom(b)
+		n, addr, err := conn.ReadFrom(b)
 		addrStr := "unknown"
 		if addr != nil {
 			addrStr = addr.String()
 		}
 		if err != nil {
 			if errors.Is(err, net.ErrClosed) {
-				close(listener.incoming)
 				return
 			}
-			listener.conf.ErrorLog.Error("read from: " + err.Error(), "raddr", addrStr)
+			listener.conf.ErrorLog.Error("read from: "+err.Error(), "raddr", addrStr)
 			continue
-		} else if n == 0 || listener.sec.blocked(addr) {
+		} else if n == 0 {
 			continue
 		}
-		if err = listener.handle(b[:n], addr); err != nil && !errors.Is(err, net.ErrClosed) {
-			listener.conf.ErrorLog.Error("handle packet: "+err.Error(), "raddr", addrStr, "block-duration", max(0, listener.conf.BlockDuration))
-			listener.sec.block(addr)
-		}
+		listener.dispatchDatagram(b[:n], addr, unconnectedDatagrams)
 	}
 }
 
-// handle handles an incoming packet in buffer b from the address passed. If
-// not successful, an error is returned describing the issue.
-func (listener *Listener) handle(b []byte, addr net.Addr) error {
-	value, found := listener.connections.Load(resolve(addr))
-	if !found {
-		return listener.handler.handleUnconnected(b, addr)
+func (listener *Listener) startUnconnectedDatagramWorkers(unconnectedDatagrams <-chan listenerUnconnectedDatagram) {
+	for i := 0; i < listenerUnconnectedDatagramWorkers; i++ {
+		go func() {
+			for {
+				select {
+				case <-listener.closed:
+					return
+				case datagram, ok := <-unconnectedDatagrams:
+					if !ok {
+						return
+					}
+					listener.handleUnconnectedDatagram(datagram)
+				}
+			}
+		}()
 	}
-	conn := value.(*Conn)
-	select {
-	case <-conn.ctx.Done():
-		// Connection was closed already.
-		return nil
-	default:
-		if err := conn.receive(b); err != nil {
-			conn.closeImmediately()
-			return err
+}
+
+func (listener *Listener) dispatchDatagram(b []byte, addr net.Addr, unconnectedDatagrams chan<- listenerUnconnectedDatagram) {
+	if len(b) == 0 || listener.sec.blocked(addr) {
+		return
+	}
+
+	payload := make([]byte, len(b))
+	copy(payload, b)
+
+	if b[0]&bitFlagDatagram != 0 || b[0] == message.IDDisconnectNotification {
+		if value, found := listener.connections.Load(resolve(addr)); found {
+			value.(*Conn).queueIncomingDatagram(payload)
 		}
-		return nil
+		return
+	}
+
+	// Avoid unbounded unconnected backlog under packet floods by dropping when
+	// the worker queue is saturated.
+	select {
+	case <-listener.closed:
+		return
+	case unconnectedDatagrams <- listenerUnconnectedDatagram{addr: addr, data: payload}:
+	default:
+	}
+}
+
+func (listener *Listener) handleUnconnectedDatagram(datagram listenerUnconnectedDatagram) {
+	if err := listener.handler.handleUnconnected(datagram.data, datagram.addr); err != nil && !errors.Is(err, net.ErrClosed) {
+		addrStr := "unknown"
+		if datagram.addr != nil {
+			addrStr = datagram.addr.String()
+			listener.sec.block(datagram.addr)
+		}
+		listener.conf.ErrorLog.Error("handle packet: "+err.Error(), "raddr", addrStr, "block-duration", max(0, listener.conf.BlockDuration))
 	}
 }
 

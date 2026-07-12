@@ -17,13 +17,22 @@ type ConnectionRequestAccepted struct {
 }
 
 func (pk *ConnectionRequestAccepted) UnmarshalBinary(data []byte) error {
+	remainingSize := len(data)
 	if len(data) < addrSize(data) {
 		return io.ErrUnexpectedEOF
 	}
 	var offset int
 	pk.ClientAddress, offset = addr(data)
+	remainingSize -= offset
+	if remainingSize < 2 {
+		return io.ErrUnexpectedEOF
+	}
 	pk.SystemIndex = binary.BigEndian.Uint16(data[offset:])
 	offset += 2
+	remainingSize -= 2
+	if remainingSize < 16 {
+		return io.ErrUnexpectedEOF
+	}
 	for i := range 20 {
 		if len(data[offset:]) == 16 {
 			// Some implementations send fewer system addresses.
@@ -45,15 +54,18 @@ func (pk *ConnectionRequestAccepted) UnmarshalBinary(data []byte) error {
 }
 
 func (pk *ConnectionRequestAccepted) MarshalBinary() (data []byte, err error) {
-	nAddr, nSys := sizeofAddr(pk.ClientAddress), pk.SystemAddresses.sizeOf()
+	nAddr, nSys := sizeofAddr(pk.ClientAddress), pk.SystemAddresses.validSizeOf()
 	b := make([]byte, 1+nAddr+2+nSys+16)
 	b[0] = IDConnectionRequestAccepted
 	offset := 1 + putAddr(b[1:], pk.ClientAddress)
 	binary.BigEndian.PutUint16(b[offset:], pk.SystemIndex)
+	offset += 2
 	for _, addr := range pk.SystemAddresses {
-		offset += putAddr(b[offset+2:], addr)
+		if addr.IsValid() {
+			offset += putAddr(b[offset:], addr)
+		}
 	}
-	binary.BigEndian.PutUint64(b[offset+2:], uint64(pk.PingTime))
-	binary.BigEndian.PutUint64(b[offset+10:], uint64(pk.PongTime))
+	binary.BigEndian.PutUint64(b[offset:], uint64(pk.PingTime))
+	binary.BigEndian.PutUint64(b[offset+8:], uint64(pk.PongTime))
 	return b, nil
 }

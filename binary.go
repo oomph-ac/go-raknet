@@ -2,7 +2,6 @@ package raknet
 
 import (
 	"bytes"
-	"io"
 )
 
 // uint24 represents an integer existing out of 3 bytes. It is actually a
@@ -14,16 +13,6 @@ func (u *uint24) Inc() (old uint24) {
 	ret := *u
 	*u += 1
 	return ret
-}
-
-// readUint24 reads 3 bytes from the buffer passed and combines it into a
-// uint24. If there were no 3 bytes to read, an error is returned.
-func readUint24(buf *bytes.Buffer) (uint24, error) {
-	b := make([]byte, 3)
-	if _, err := buf.Read(b); err != nil {
-		return 0, io.ErrUnexpectedEOF
-	}
-	return loadUint24(b), nil
 }
 
 // loadUint24 interprets the first 3 bytes in b as a uint24.

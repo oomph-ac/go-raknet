@@ -10,7 +10,7 @@ type ConnectedPing struct {
 }
 
 func (pk *ConnectedPing) UnmarshalBinary(data []byte) error {
-	if len(data) < 8 {
+	if len(data) != 8 {
 		return io.ErrUnexpectedEOF
 	}
 	pk.PingTime = int64(binary.BigEndian.Uint64(data))

@@ -125,3 +125,8 @@ func (ack *acknowledgement) read(b []byte) error {
 	}
 	return nil
 }
+
+type fullPacketAcknowledgement struct {
+	remaining  uint32
+	internalID uint64
+}

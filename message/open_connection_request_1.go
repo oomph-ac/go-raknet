@@ -19,7 +19,7 @@ func (pk *OpenConnectionRequest1) MarshalBinary() (data []byte, err error) {
 	}
 	b := make([]byte, pk.MTU-20-8) // IP Header: 20 bytes, UDP Header: 8 bytes.
 	b[0] = IDOpenConnectionRequest1
-	copy(b[1:], unconnectedMessageSequence[:])
+	copy(b[1:], UnconnectedMessageSequence[:])
 	b[17] = pk.ClientProtocol
 
 	cachedOCR1[pk.MTU] = b
