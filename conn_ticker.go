@@ -1,13 +1,12 @@
 package raknet
 
 import (
-	"net/netip"
 	"sync"
 	"time"
 )
 
 var (
-	activeConnections   = make(map[netip.AddrPort]*Conn)
+	activeConnections   = make(map[*Conn]struct{})
 	activeConnectionsMu sync.Mutex
 )
 
@@ -22,7 +21,7 @@ func tickConnections() {
 	unregisterQueue := make([]*Conn, 0, 64)
 	for t := range ticker.C {
 		activeConnectionsMu.Lock()
-		for _, conn := range activeConnections {
+		for conn := range activeConnections {
 			select {
 			case <-conn.ctx.Done():
 				// Connection was closed, queue it for unregistration.
@@ -49,16 +48,15 @@ func registerConnection(conn *Conn) {
 	activeConnectionsMu.Lock()
 	defer activeConnectionsMu.Unlock()
 
-	activeConnections[resolve(conn.raddr)] = conn
+	activeConnections[conn] = struct{}{}
 }
 
 func unregisterTickedConnection(conn *Conn) {
 	activeConnectionsMu.Lock()
 	defer activeConnectionsMu.Unlock()
 
-	addr := resolve(conn.raddr)
-	if _, ok := activeConnections[addr]; ok {
-		delete(activeConnections, addr)
+	if _, ok := activeConnections[conn]; ok {
+		delete(activeConnections, conn)
 		close(conn.ticker)
 	}
 }

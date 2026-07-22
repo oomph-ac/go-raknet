@@ -8,6 +8,7 @@ import (
 	"net/netip"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -850,10 +851,10 @@ func TestSecurity_NACKAmplificationAttackMitigated(t *testing.T) {
 	// Expected amplification: ~1.5MB / 450 bytes = ~3,400x
 	// This is significantly less than the 50,000x+ without mitigations.
 
-	var totalBytesSent int
+	var totalBytesSent atomic.Int64
 	mockConn := &mockPacketConn{
 		writeToFunc: func(p []byte, addr net.Addr) (n int, err error) {
-			totalBytesSent += len(p)
+			totalBytesSent.Add(int64(len(p)))
 			return len(p), nil
 		},
 	}
@@ -871,7 +872,7 @@ func TestSecurity_NACKAmplificationAttackMitigated(t *testing.T) {
 	}
 	conn.mu.Unlock()
 
-	totalBytesSent = 0 // Reset after setup.
+	totalBytesSent.Store(0) // Reset after setup.
 
 	// Simulate attacker sending many small NACKs requesting large ranges.
 	attackerNACKBytes := 0
@@ -892,14 +893,15 @@ func TestSecurity_NACKAmplificationAttackMitigated(t *testing.T) {
 	}
 
 	// Calculate amplification factor.
-	amplificationFactor := float64(totalBytesSent) / float64(attackerNACKBytes)
+	responseBytes := totalBytesSent.Load()
+	amplificationFactor := float64(responseBytes) / float64(attackerNACKBytes)
 
 	// Calculate what the amplification would be WITHOUT mitigations.
 	// 50 NACKs × 500 packets = 25,000 potential resends × 1KB = 25MB.
 	unmititgatedBytes := 50 * 500 * 1000
 	unmitigatedAmplification := float64(unmititgatedBytes) / float64(attackerNACKBytes)
 
-	t.Logf("Attack stats: %d NACK bytes -> %d response bytes", attackerNACKBytes, totalBytesSent)
+	t.Logf("Attack stats: %d NACK bytes -> %d response bytes", attackerNACKBytes, responseBytes)
 	t.Logf("Actual amplification: %.2fx", amplificationFactor)
 	t.Logf("Unmitigated amplification would be: %.2fx", unmitigatedAmplification)
 	t.Logf("Mitigation effectiveness: %.2f%% reduction", (1-amplificationFactor/unmitigatedAmplification)*100)
@@ -916,7 +918,7 @@ func TestSecurity_NACKAmplificationAttackMitigated(t *testing.T) {
 	// Max response per second is bounded by: budget * packet_size = 512 * ~1KB = ~512KB/s
 	// In this test we only run one "second" of attack, so response should be around that.
 	maxExpectedBytes := nackBudgetPerSecond * 1050 // 512 * 1050 ≈ 537KB
-	if totalBytesSent > maxExpectedBytes*2 {       // Allow some margin for timing
-		t.Errorf("total bytes sent (%d) exceeds expected maximum (%d)", totalBytesSent, maxExpectedBytes*2)
+	if responseBytes > int64(maxExpectedBytes*2) { // Allow some margin for timing
+		t.Errorf("total bytes sent (%d) exceeds expected maximum (%d)", responseBytes, maxExpectedBytes*2)
 	}
 }
