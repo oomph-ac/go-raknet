@@ -624,24 +624,32 @@ func (conn *Conn) write(b []byte) (n int, err error) {
 // Read blocks until a packet is received over the connection, or until the
 // session is closed or the read times out, in which case an error is returned.
 func (conn *Conn) Read(b []byte) (n int, err error) {
-	pk, ok := <-conn.packets
-	if !ok {
+	select {
+	case <-conn.ctx.Done():
 		return 0, conn.error(net.ErrClosed, "read")
-	} else if len(b) < len(pk) {
-		return 0, conn.error(ErrBufferTooSmall, "read")
+	case pk, ok := <-conn.packets:
+		if !ok {
+			return 0, conn.error(net.ErrClosed, "read")
+		} else if len(b) < len(pk) {
+			return 0, conn.error(ErrBufferTooSmall, "read")
+		}
+		return copy(b, pk), nil
 	}
-	return copy(b, pk), err
 }
 
 // ReadPacket attempts to read the next packet as a byte slice. ReadPacket
 // blocks until a packet is received over the connection, or until the session
 // is closed or the read times out, in which case an error is returned.
 func (conn *Conn) ReadPacket() (b []byte, err error) {
-	pk, ok := <-conn.packets
-	if !ok {
+	select {
+	case <-conn.ctx.Done():
 		return nil, conn.error(net.ErrClosed, "read")
+	case pk, ok := <-conn.packets:
+		if !ok {
+			return nil, conn.error(net.ErrClosed, "read")
+		}
+		return pk, nil
 	}
-	return pk, err
 }
 
 // Close closes the connection. All blocking Read or Write actions are
@@ -1023,7 +1031,13 @@ func (conn *Conn) handlePacket(b []byte, reliability byte) error {
 		return fmt.Errorf("handle packet: %w", err)
 	}
 	if !handled {
-		conn.packets <- b
+		// Respect connection cancellation so senders do not block forever after
+		// closeImmediately cancels the context (Read/ReadPacket do the same).
+		select {
+		case <-conn.ctx.Done():
+			return nil
+		case conn.packets <- b:
+		}
 	}
 	return nil
 }
